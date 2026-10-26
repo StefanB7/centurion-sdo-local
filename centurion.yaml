@@ -1,0 +1,295 @@
+# Standalone Centurion SDO4 SMART / SDO5 SMART+ controller.
+#
+# The ESP32 is a BLE central here: it speaks the Centurion serial protocol
+# directly and publishes the door over MQTT over TLS. Home Assistant is
+# optional; any MQTT client can use the state/command topics. This is a pure
+# MQTT build: no web_server and no native API by default.
+#
+# Based on the protocol analysis in docs/PROTOCOL.md, confirmed working on a
+# real operator. Test on the bench with your own unit before relying on it.
+
+substitutions:
+  name: centurion-garage
+  friendly_name: Centurion Garage
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  # For protocol troubleshooting set this to DEBUG; the component logs every
+  # notification and the session state at that level.
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Keep the radio responsive for the BLE link.
+  power_save_mode: none
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret fallback_password
+
+# Provisioning-only fallback AP. It does not expose entity control; there is
+# deliberately no web_server block. Remove ap/captive_portal too if you do not
+# want an HTTP listener on the fallback network at all.
+captive_portal:
+
+# Optional native encrypted API. It is intentionally absent for a pure MQTT
+# build because it costs RAM. See README.md before enabling it.
+# api:
+#   reboot_timeout: 0s
+#   encryption:
+#     key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+mqtt:
+  # mqtt_broker must be the DNS name covered by the broker certificate's SAN.
+  broker: !secret mqtt_broker
+  port: 8883
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  # The CA certificate is stored in secrets.yaml, never in this file.
+  certificate_authority: !secret mqtt_ca_certificate
+  # Enforce hostname verification. Use a certificate whose SAN matches
+  # mqtt_broker exactly; ESP-IDF/mbedTLS does not validate wildcards.
+  # WORKAROUND: the broker's server certificate has no SAN for mqtt_broker, so
+  # name matching is skipped. The chain is still verified against the CA. Reissue
+  # the server cert with a SAN, then set this back to false.
+  skip_cert_cn_check: true
+  # Discard broker-side session state on every reconnect. This does not remove
+  # retained messages; do not publish motion commands with retain=true.
+  clean_session: true
+  # Publish from the MQTT task so a slow broker does not block the main loop.
+  # This uses a little more RAM; measure on your board.
+  idf_send_async: true
+  # Never reboot just because the broker is unreachable. BLE and OTA remain
+  # available while MQTT retries.
+  reboot_timeout: 0s
+  discovery: true
+  discovery_prefix: homeassistant
+  # The default birth/will/shutdown messages stay on ${name}/status. The
+  # component's MQTT wrapper combines that node availability with the retained
+  # BLE state below into one HA discovery availability list (mode: all), so an
+  # operator entity is available only when both the node and the BLE session
+  # are usable. Do not override birth/will here.
+
+  # Optional mutual TLS. Leave commented unless the broker requires a client
+  # certificate. Put the PEM values in secrets.yaml.
+  # client_certificate: !secret mqtt_client_certificate
+  # client_certificate_key: !secret mqtt_client_key
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [centurion_ble]
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+ble_client:
+  - mac_address: !secret centurion_mac
+    id: centurion_operator
+    auto_connect: true
+
+centurion_ble:
+  id: door
+  ble_client_id: centurion_operator
+  phone: !secret centurion_phone
+  # Optional. When omitted (the recommended default), the four-byte key is
+  # captured from the operator's advertisement on every connect.
+  # key: "11223344"
+  #
+  # Optional session timings. The defaults below are shown for documentation;
+  # leave them commented unless you have measured the operator's behaviour.
+  # initial_status_timeout: 15s  # first valid overview after auth; 0s disables
+  # status_timeout: 0s           # disabled; do not assume a URC heartbeat
+
+cover:
+  - platform: centurion_ble
+    centurion_ble_id: door
+    name: Garage Door
+    device_class: garage
+    command_retain: false
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+sensor:
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: battery_voltage
+    name: Battery voltage
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - delta: 0.1  # ignore jitter below 0.1 V
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: timer_remaining
+    name: Timer remaining
+    unit_of_measurement: s
+    device_class: duration
+    accuracy_decimals: 0
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: beam_raw
+    name: Beam status raw
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+binary_sensor:
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: connected
+    id: ble_connected
+    name: BLE connected
+    device_class: connectivity
+    entity_category: diagnostic
+    # Pin the retained operator-availability topic. The component's MQTT
+    # wrapper references this state as an additional availability topic for
+    # every operator-dependent entity, alongside the global node LWT.
+    state_topic: ${name}/binary_sensor/ble_connected/state
+    retain: true
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: mains_on
+    name: Mains power
+    device_class: power
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: battery_low
+    name: Battery low
+    device_class: problem
+    entity_category: diagnostic
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: collision
+    name: Collision detected
+    device_class: problem
+    entity_category: diagnostic
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: max_collisions
+    name: Maximum collisions reached
+    device_class: problem
+    entity_category: diagnostic
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: stalled
+    name: Stalled
+    device_class: problem
+    entity_category: diagnostic
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: lost
+    name: Operator lost
+    device_class: problem
+    entity_category: diagnostic
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: limits_not_set
+    name: Limits not set
+    device_class: problem
+    entity_category: diagnostic
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: xmr_alarm
+    name: XMR alarm
+    device_class: problem
+    entity_category: diagnostic
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+text_sensor:
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: door_status
+    name: Door status
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+  - platform: centurion_ble
+    centurion_ble_id: door
+    type: power_status
+    name: Power status
+    availability:
+      topic: ${name}/binary_sensor/ble_connected/state
+      payload_available: "ON"
+      payload_not_available: "OFF"
+
+switch:
+  - platform: centurion_ble
+    centurion_ble_id: door
+    name: BLE connection
+    entity_category: config
+    command_retain: false
+    # No operator availability override: this switch inherits node-only
+    # availability so it stays usable while the BLE session is off.

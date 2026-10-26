@@ -1,0 +1,27 @@
+# Secrets and local config — never commit
+secrets.yaml
+*.pem
+*.key
+*.crt
+!secrets.example.yaml
+
+# Personal bench notes (contain network details and device addresses)
+NOTES.md
+
+# ESPHome / PlatformIO build output
+.esphome/
+.pioenvs/
+.piolibdeps/
+build/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
